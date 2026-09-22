@@ -21,15 +21,34 @@ files are still arriving indexes half-written ones.
 
 ## Settings
 
-Override by exporting, or edit the top of the script.
+```bash
+cp config.env.example config.env
+```
+
+Nothing in the script needs editing. Resolution order, highest first:
+
+1. environment variables on the command line
+2. `config.env`
+3. the Nextcloud stack's own `.env`, via `NC_STACK_DIR`
+4. built-in defaults
+
+Point `NC_STACK_DIR` at the Nextcloud stack and `NC_DATA` comes from
+there — one source of truth for that path instead of two files that
+can quietly disagree. The container name is derived from the running
+stack too (`docker compose ps -q app`) rather than guessed.
+
+`./nc-import.sh check` prints what every value resolved to, so you can
+see it without reading the script.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `NC_CONTAINER` | `nextcloud` | The container `occ` runs in |
+| `NC_STACK_DIR` | unset | Path to the Nextcloud stack; supplies `NC_DATA` and the container |
+| `NC_CONTAINER` | derived | The container `occ` runs in |
 | `NC_DATA` | `/srv/nextcloud/data` | Host path of Nextcloud's data dir |
 | `STAGING` | `/srv/nextcloud/import-staging` | **Must be the same filesystem as `NC_DATA`** |
 | `NC_UID`/`NC_GID` | `33` | `www-data` in the official image |
-| `RCLONE_FLAGS` | see script | Throttling and parallelism |
+| `RCLONE_FLAGS` | see `config.env.example` | Throttling and parallelism |
+| `OD_CLIENT_ID`/`_SECRET` | unset | Your own Azure app registration |
 
 `check` refuses to continue if staging is on a different filesystem
 from the data directory. `install` uses `mv`, which on one filesystem

@@ -17,23 +17,71 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---- settings -------------------------------------------------------
-NC_CONTAINER="${NC_CONTAINER:-nextcloud}"
-# Host path of Nextcloud's data directory.
+# Resolution order, highest priority first:
+#   1. environment variables already set
+#   2. ./config.env
+#   3. the Nextcloud stack's .env (NC_STACK_DIR)
+#   4. defaults below
+#
+# Reading the stack's .env matters: NC_DATA lives in exactly one place
+# rather than in two files that can silently disagree.
+
+# Note the explicit if and the trailing return: under `set -e`, a
+# bare `declare -p "$v" && echo "$v"` exits the shell the first time
+# the variable is unset, because a failing compound as the last
+# command in the loop body aborts.
+_preset() {
+    local v
+    for v in "$@"; do
+        if declare -p "$v" >/dev/null 2>&1; then echo "$v"; fi
+    done
+    return 0
+}
+# Remember which were already in the environment, so config.env does
+# not clobber a deliberate command-line override.
+_FROM_ENV="$(_preset NC_CONTAINER NC_DATA STAGING NC_UID NC_GID RCLONE_FLAGS \
+                     OD_CLIENT_ID OD_CLIENT_SECRET NC_STACK_DIR | tr '\n' ' ')" || true
+
+_load() {  # _load <file> — KEY=VALUE lines, skipping anything preset
+    local f="$1" key val
+    [[ -r "$f" ]] || return 0
+    while IFS='=' read -r key val; do
+        key="$(printf '%s' "$key" | tr -d '[:space:]')"
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        [[ " $_FROM_ENV " == *" $key "* ]] && continue
+        # strip surrounding quotes, keep inner spaces
+        val="${val%\"}"; val="${val#\"}"
+        val="${val%\'}"; val="${val#\'}"
+        printf -v "$key" '%s' "$val" 2>/dev/null || declare -g "$key=$val"
+        export "$key"
+        # First file to set a key wins, so a later load (the stack's
+        # own .env) fills gaps rather than overriding config.env.
+        _FROM_ENV="$_FROM_ENV $key "
+    done < "$f"
+}
+
+_load "$DIR/config.env"
+
+# The stack's .env fills the gaps config.env left.
+if [[ -n "${NC_STACK_DIR:-}" ]]; then
+    STACK="$(cd "$DIR" && cd "$NC_STACK_DIR" 2>/dev/null && pwd || true)"
+    if [[ -n "$STACK" && -r "$STACK/.env" ]]; then
+        _load "$STACK/.env"
+        # Derive the container from the running stack rather than
+        # guessing at its name.
+        if [[ -z "${NC_CONTAINER:-}" ]] && [[ -r "$STACK/docker-compose.yml" ]]; then
+            NC_CONTAINER="$(docker compose -f "$STACK/docker-compose.yml" \
+                            ps -q app 2>/dev/null | head -1 || true)"
+        fi
+    fi
+fi
+
+NC_CONTAINER="${NC_CONTAINER:-nextcloud-app-1}"
 NC_DATA="${NC_DATA:-/srv/nextcloud/data}"
-# Staging MUST be on the same filesystem as NC_DATA: install uses mv,
-# which is then instant and needs no extra space. Across filesystems
-# it becomes a full copy — twice the disk, hours longer.
 STAGING="${STAGING:-/srv/nextcloud/import-staging}"
-# www-data inside the official image.
 NC_UID="${NC_UID:-33}"
 NC_GID="${NC_GID:-33}"
-# Microsoft throttles hard; unthrottled runs stall.
 RCLONE_FLAGS="${RCLONE_FLAGS:---transfers 4 --checkers 8 --tpslimit 10}"
-# Your own Azure app registration. Optional but worth it: rclone's
-# built-in client ID is rate-limited across every rclone user
-# everywhere, which is a common cause of slow OneDrive transfers.
-# Personal accounts still require each person to sign in once — there
-# is no tenant, so no admin consent and no service-principal path.
 OD_CLIENT_ID="${OD_CLIENT_ID:-}"
 OD_CLIENT_SECRET="${OD_CLIENT_SECRET:-}"
 
@@ -62,6 +110,16 @@ each_user() {  # each_user <callback> [filter]
 # ---- check ----------------------------------------------------------
 cmd_check() {
     local fail=0
+
+    echo "Resolved settings:"
+    printf '  %-14s %s\n' NC_CONTAINER "$NC_CONTAINER"
+    printf '  %-14s %s\n' NC_DATA      "$NC_DATA"
+    printf '  %-14s %s\n' STAGING      "$STAGING"
+    printf '  %-14s %s:%s\n' OWNERSHIP "$NC_UID" "$NC_GID"
+    printf '  %-14s %s\n' RCLONE_FLAGS "$RCLONE_FLAGS"
+    printf '  %-14s %s\n' CLIENT_ID    "${OD_CLIENT_ID:-(rclone default — shared rate limit)}"
+    [[ -r "$DIR/config.env" ]] || echo "  (no config.env — using defaults; cp config.env.example config.env)"
+    echo
 
     command -v rclone >/dev/null || { echo "MISSING: rclone not installed" >&2; fail=1; }
 
