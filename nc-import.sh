@@ -98,13 +98,26 @@ rc() {  # rclone with the right person's config
 }
 
 each_user() {  # each_user <callback> [filter]
-    local cb="$1" want="${2:---all}"
+    local cb="$1" want="${2:---all}" matched=0 known=()
     while IFS='|' read -r u r n <&3; do
         u="$(trim "${u:-}")"; r="$(trim "${r:-}")"; n="$(trim "${n:-$u}")"
         [[ -z "$u" || "$u" == \#* ]] && continue
+        known+=("$u")
         [[ "$want" == "--all" || "$want" == "$u" ]] || continue
+        matched=1
         "$cb" "$u" "$r" "$n"
     done 3< "$USERS"
+
+    # Silence here means a filter that matched nobody — most often an
+    # rclone remote ('od-bill') where a Nextcloud user ('bill') was
+    # wanted. Without this the command does nothing and says nothing.
+    if [[ "$matched" == 0 ]]; then
+        echo "error: no user matching '$want' in $USERS" >&2
+        echo "       known users: ${known[*]}" >&2
+        echo "       (fetch/install/verify take the Nextcloud user;" >&2
+        echo "        only 'auth' takes the rclone remote)" >&2
+        return 1
+    fi
 }
 
 # ---- check ----------------------------------------------------------
@@ -128,7 +141,23 @@ cmd_check() {
 
     [[ -d "$NC_DATA" ]] || { echo "MISSING: NC_DATA '$NC_DATA' is not a directory" >&2; fail=1; }
 
-    mkdir -p "$STAGING"
+    case "$STAGING/" in
+        "$NC_DATA"/*)
+            echo "FAIL: STAGING is inside NC_DATA." >&2
+            echo "      Partial downloads would sit in Nextcloud's data" >&2
+            echo "      directory while fetch runs. Put it alongside:" >&2
+            echo "      STAGING=$(dirname "$NC_DATA")/import-staging" >&2
+            fail=1 ;;
+    esac
+
+    mkdir -p "$STAGING" 2>/dev/null || {
+        echo "FAIL: cannot create $STAGING — run this with sudo." >&2
+        echo "      install moves files into $NC_DATA and chowns them" >&2
+        echo "      to $NC_UID:$NC_GID, so the whole run needs root." >&2
+        echo "      The rclone configs live in this directory, not your" >&2
+        echo "      home, so sudo does not lose them." >&2
+        fail=1
+    }
     if [[ -d "$NC_DATA" ]]; then
         local a b
         a="$(stat -c %d "$NC_DATA")"
