@@ -97,13 +97,6 @@ rc() {  # rclone with the right person's config
     rclone --config "$CONFDIR/$remote.conf" "$@"
 }
 
-# Patterns to skip, one per line, in excludes.txt beside this script.
-# A separate file rather than a flag in RCLONE_FLAGS, because that
-# variable is word-split when expanded: any pattern containing a
-# space ("Personal Vault/**") would arrive at rclone in pieces.
-EXCLUDE_ARGS=()
-[[ -f "$DIR/excludes.txt" ]] && EXCLUDE_ARGS=(--exclude-from "$DIR/excludes.txt")
-
 each_user() {  # each_user <callback> [filter]
     local cb="$1" want="${2:---all}" matched=0 known=()
     while IFS='|' read -r u r n <&3; do
@@ -127,37 +120,6 @@ each_user() {  # each_user <callback> [filter]
     fi
 }
 
-# ---- drive id -------------------------------------------------------
-# rclone's onedrive backend needs drive_id as well as drive_type, and
-# only the interactive 'rclone config' flow asks for it. 'rclone
-# authorize' returns a bare token, so we look the drive up ourselves
-# with the access token that token blob carries. Without this, every
-# operation fails with "unable to get drive_id and drive_type".
-_fill_drive() {  # _fill_drive <remote>
-    local remote="$1" target="$CONFDIR/$1.conf" at resp id dt
-
-    grep -q '^drive_id = ' "$target" && { echo "$remote: drive_id already set"; return 0; }
-
-    at="$(sed -n 's/^token = //p' "$target" \
-        | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')" \
-        || { echo "error: could not read access_token from $target" >&2; return 1; }
-
-    resp="$(curl -fsS -H "Authorization: Bearer $at" \
-        https://graph.microsoft.com/v1.0/me/drive)" \
-        || { echo "error: Graph request failed — the token may have expired." >&2
-             echo "       Re-run 'rclone authorize' and paste a fresh one." >&2
-             return 1; }
-
-    id="$(printf '%s' "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')"
-    dt="$(printf '%s' "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("driveType","personal"))')"
-    [[ -n "$id" ]] || { echo "error: Graph returned no drive id" >&2; return 1; }
-
-    # Replace the placeholder drive_type and append the real drive_id.
-    sed -i "s/^drive_type = .*/drive_type = $dt/" "$target"
-    printf 'drive_id = %s\n' "$id" >> "$target"
-    echo "$remote: drive_id $id ($dt)"
-}
-
 # ---- check ----------------------------------------------------------
 cmd_check() {
     local fail=0
@@ -173,9 +135,6 @@ cmd_check() {
     echo
 
     command -v rclone >/dev/null || { echo "MISSING: rclone not installed" >&2; fail=1; }
-    # Both used by the drive_id lookup in 'paste' / 'drive'.
-    command -v curl >/dev/null    || { echo "MISSING: curl not installed" >&2; fail=1; }
-    command -v python3 >/dev/null || { echo "MISSING: python3 not installed" >&2; fail=1; }
 
     docker inspect "$NC_CONTAINER" >/dev/null 2>&1 \
         || { echo "MISSING: container '$NC_CONTAINER' not found" >&2; fail=1; }
@@ -278,10 +237,7 @@ NOTE
     chmod 600 "$target"
 
     echo
-    echo "Wrote $target — looking up the drive:"
-    _fill_drive "$remote" || { echo "!! config is incomplete" >&2; exit 1; }
-
-    echo "Checking it works:"
+    echo "Wrote $target — checking it works:"
     rc "$remote" about "$remote:" \
         || echo "!! rclone could not use it; the token may be incomplete" >&2
 }
@@ -346,12 +302,9 @@ _fetch_user() {
     local dest="$STAGING/$u"
     mkdir -p "$dest"
     echo "==> $u from $r:"
-    # Excludes here too, or the pre-flight logs errors for paths the
-    # copy is never going to touch — and reports a total that does not
-    # match what actually transfers.
-    rc "$r" size "$r:" "${EXCLUDE_ARGS[@]}" || true
+    rc "$r" size "$r:" || true
     # copy is resumable: re-running skips what is already present.
-    rc "$r" copy "$r:" "$dest" $RCLONE_FLAGS "${EXCLUDE_ARGS[@]}" \
+    rc "$r" copy "$r:" "$dest" $RCLONE_FLAGS \
         --progress \
         --log-file "$DIR/rclone-$u.log" --log-level INFO \
         || { echo "!! $u failed — rerun to resume; see rclone-$u.log" >&2; return 1; }
@@ -367,19 +320,8 @@ _install_user() {
     local dst="$NC_DATA/$u/files/OneDrive"
 
     [[ -d "$src" ]] || { echo "skip $u: nothing staged" >&2; return 0; }
-    # A bare -d test conflates three different problems, so say which.
-    if [[ ! -d "$NC_DATA/$u/files" ]]; then
-        if [[ ! -r "$NC_DATA" ]]; then
-            echo "skip $u: cannot read $NC_DATA — run this with sudo." >&2
-        elif [[ -d "$NC_DATA/$u" ]]; then
-            echo "skip $u: $NC_DATA/$u exists but has no 'files' directory." >&2
-            echo "         Nextcloud creates it at first login, not at" >&2
-            echo "         user:add. Log in as $u once, then rerun." >&2
-        else
-            echo "skip $u: no Nextcloud user '$u' — create them first" >&2
-        fi
-        return 0
-    fi
+    [[ -d "$NC_DATA/$u/files" ]] || {
+        echo "skip $u: no Nextcloud user '$u' — create them first" >&2; return 0; }
     [[ -e "$dst" ]] && { echo "skip $u: $dst already exists" >&2; return 0; }
 
     mv "$src" "$dst"
@@ -447,7 +389,6 @@ case "${1:-}" in
     fetch)   shift; cmd_fetch "${1:---all}" ;;
     install) shift; cmd_install "${1:---all}" ;;
     verify)  shift; cmd_verify "${1:---all}" ;;
-    drive)   shift; _fill_drive "${1:?usage: $0 drive <remote>}" ;;
     shared)  shift; cmd_shared "$@" ;;
     *) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
 esac
