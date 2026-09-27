@@ -1,0 +1,7 @@
+# One pattern per line. Applies to every fetch.
+#
+# Personal Vault is BitLocker-protected and cannot be read through the
+# Graph API at all, locked or unlocked. rclone logs an error on every
+# listing pass and moves on; excluding it keeps the log readable.
+# Anything in there has to be moved across by hand.
+Personal Vault/**
