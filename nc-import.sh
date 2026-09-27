@@ -8,6 +8,8 @@
 #   ./nc-import.sh install [user|--all]  move into Nextcloud and index
 #   ./nc-import.sh verify [user|--all]   compare source against result
 #   ./nc-import.sh shared             fetch + install the group folder
+  ./nc-import.sh bg <subcommand>    run one of the above detached, so it
+                                    survives the terminal closing
 #
 # Files land on disk directly and Nextcloud is told to index them,
 # rather than being uploaded through WebDAV. On any real volume that
@@ -39,7 +41,7 @@ _preset() {
 }
 # Remember which were already in the environment, so config.env does
 # not clobber a deliberate command-line override.
-_FROM_ENV="$(_preset NC_CONTAINER NC_DATA STAGING NC_UID NC_GID RCLONE_FLAGS \
+_FROM_ENV="$(_preset NC_CONTAINER NC_DATA STAGING IMPORT_SUBDIR NC_UID NC_GID RCLONE_FLAGS \
                      OD_CLIENT_ID OD_CLIENT_SECRET NC_STACK_DIR | tr '\n' ' ')" || true
 
 _load() {  # _load <file> — KEY=VALUE lines, skipping anything preset
@@ -79,6 +81,11 @@ fi
 NC_CONTAINER="${NC_CONTAINER:-nextcloud-app-1}"
 NC_DATA="${NC_DATA:-/srv/nextcloud/data}"
 STAGING="${STAGING:-/srv/nextcloud/import-staging}"
+# Where a person's OneDrive lands inside their Nextcloud files.
+# Empty (the default) means the root of their files. Set it to a name
+# such as "OneDrive" to keep the import in its own folder, which
+# avoids any chance of colliding with what is already there.
+IMPORT_SUBDIR="${IMPORT_SUBDIR-}"
 NC_UID="${NC_UID:-33}"
 NC_GID="${NC_GID:-33}"
 RCLONE_FLAGS="${RCLONE_FLAGS:---transfers 4 --checkers 8 --tpslimit 10}"
@@ -96,6 +103,13 @@ rc() {  # rclone with the right person's config
     local remote="$1"; shift
     rclone --config "$CONFDIR/$remote.conf" "$@"
 }
+
+# Patterns to skip, one per line, in excludes.txt beside this script.
+# A separate file rather than a flag in RCLONE_FLAGS, because that
+# variable is word-split when expanded: any pattern containing a
+# space ("Personal Vault/**") would arrive at rclone in pieces.
+EXCLUDE_ARGS=()
+[[ -f "$DIR/excludes.txt" ]] && EXCLUDE_ARGS=(--exclude-from "$DIR/excludes.txt")
 
 each_user() {  # each_user <callback> [filter]
     local cb="$1" want="${2:---all}" matched=0 known=()
@@ -120,6 +134,57 @@ each_user() {  # each_user <callback> [filter]
     fi
 }
 
+# ---- drive id -------------------------------------------------------
+# rclone's onedrive backend needs drive_id as well as drive_type, and
+# only the interactive 'rclone config' flow asks for it. 'rclone
+# authorize' returns a bare token, so we look the drive up ourselves
+# with the access token that token blob carries. Without this, every
+# operation fails with "unable to get drive_id and drive_type".
+_fill_drive() {  # _fill_drive <remote>
+    local remote="$1" target="$CONFDIR/$1.conf" at resp id dt
+
+    grep -q '^drive_id = ' "$target" && { echo "$remote: drive_id already set"; return 0; }
+
+    at="$(sed -n 's/^token = //p' "$target" \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')" \
+        || { echo "error: could not read access_token from $target" >&2; return 1; }
+
+    resp="$(curl -fsS -H "Authorization: Bearer $at" \
+        https://graph.microsoft.com/v1.0/me/drive)" \
+        || { echo "error: Graph request failed — the token may have expired." >&2
+             echo "       Re-run 'rclone authorize' and paste a fresh one." >&2
+             return 1; }
+
+    id="$(printf '%s' "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')"
+    dt="$(printf '%s' "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("driveType","personal"))')"
+    [[ -n "$id" ]] || { echo "error: Graph returned no drive id" >&2; return 1; }
+
+    # Replace the placeholder drive_type and append the real drive_id.
+    sed -i "s/^drive_type = .*/drive_type = $dt/" "$target"
+    printf 'drive_id = %s\n' "$id" >> "$target"
+    echo "$remote: drive_id $id ($dt)"
+}
+
+# ---- detached runs --------------------------------------------------
+# A fetch is hours long and dies with its terminal, taking the session
+# with it when SSH drops. setsid puts it in its own session so the
+# hangup never reaches it; nohup covers the moment before that.
+cmd_bg() {
+    [[ $# -gt 0 ]] || { echo "usage: $0 bg <subcommand> [args]" >&2; exit 1; }
+    local stamp logf
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    logf="$DIR/nc-import-$1-$stamp.log"
+
+    setsid nohup bash "$0" "$@" >"$logf" 2>&1 </dev/null &
+    local pid=$!
+    disown "$pid" 2>/dev/null || true
+
+    echo "started in background: pid $pid"
+    echo "  log:   $logf"
+    echo "  watch: tail -f $logf"
+    echo "  stop:  kill $pid"
+}
+
 # ---- check ----------------------------------------------------------
 cmd_check() {
     local fail=0
@@ -135,6 +200,9 @@ cmd_check() {
     echo
 
     command -v rclone >/dev/null || { echo "MISSING: rclone not installed" >&2; fail=1; }
+    # Both used by the drive_id lookup in 'paste' / 'drive'.
+    command -v curl >/dev/null    || { echo "MISSING: curl not installed" >&2; fail=1; }
+    command -v python3 >/dev/null || { echo "MISSING: python3 not installed" >&2; fail=1; }
 
     docker inspect "$NC_CONTAINER" >/dev/null 2>&1 \
         || { echo "MISSING: container '$NC_CONTAINER' not found" >&2; fail=1; }
@@ -237,7 +305,10 @@ NOTE
     chmod 600 "$target"
 
     echo
-    echo "Wrote $target — checking it works:"
+    echo "Wrote $target — looking up the drive:"
+    _fill_drive "$remote" || { echo "!! config is incomplete" >&2; exit 1; }
+
+    echo "Checking it works:"
     rc "$remote" about "$remote:" \
         || echo "!! rclone could not use it; the token may be incomplete" >&2
 }
@@ -302,10 +373,18 @@ _fetch_user() {
     local dest="$STAGING/$u"
     mkdir -p "$dest"
     echo "==> $u from $r:"
-    rc "$r" size "$r:" || true
+    # Excludes here too, or the pre-flight logs errors for paths the
+    # copy is never going to touch — and reports a total that does not
+    # match what actually transfers.
+    rc "$r" size "$r:" "${EXCLUDE_ARGS[@]}" || true
     # copy is resumable: re-running skips what is already present.
-    rc "$r" copy "$r:" "$dest" $RCLONE_FLAGS \
-        --progress \
+    # --progress redraws with escape codes, which is unreadable in a
+    # log file. Periodic one-line stats when output is not a terminal.
+    local progress=(--stats 60s --stats-one-line)
+    [[ -t 1 ]] && progress=(--progress)
+
+    rc "$r" copy "$r:" "$dest" $RCLONE_FLAGS "${EXCLUDE_ARGS[@]}" \
+        "${progress[@]}" \
         --log-file "$DIR/rclone-$u.log" --log-level INFO \
         || { echo "!! $u failed — rerun to resume; see rclone-$u.log" >&2; return 1; }
     echo "    staged at $dest"
@@ -317,17 +396,53 @@ cmd_fetch() { each_user _fetch_user "${1:---all}"; }
 _install_user() {
     local u="$1"
     local src="$STAGING/$u"
-    local dst="$NC_DATA/$u/files/OneDrive"
+    local root="$NC_DATA/$u/files"
+    local dst="${IMPORT_SUBDIR:+$root/$IMPORT_SUBDIR}"
+    dst="${dst:-$root}"
 
     [[ -d "$src" ]] || { echo "skip $u: nothing staged" >&2; return 0; }
-    [[ -d "$NC_DATA/$u/files" ]] || {
-        echo "skip $u: no Nextcloud user '$u' — create them first" >&2; return 0; }
-    [[ -e "$dst" ]] && { echo "skip $u: $dst already exists" >&2; return 0; }
+    # A bare -d test conflates three different problems, so say which.
+    if [[ ! -d "$NC_DATA/$u/files" ]]; then
+        if [[ ! -r "$NC_DATA" ]]; then
+            echo "skip $u: cannot read $NC_DATA — run this with sudo." >&2
+        elif [[ -d "$NC_DATA/$u" ]]; then
+            echo "skip $u: $NC_DATA/$u exists but has no 'files' directory." >&2
+            echo "         Nextcloud creates it at first login, not at" >&2
+            echo "         user:add. Log in as $u once, then rerun." >&2
+        else
+            echo "skip $u: no Nextcloud user '$u' — create them first" >&2
+        fi
+        return 0
+    fi
+    if [[ -n "$IMPORT_SUBDIR" ]]; then
+        # Whole tree in one move: fast, and nothing to collide with.
+        [[ -e "$dst" ]] && { echo "skip $u: $dst already exists" >&2; return 0; }
+        mv "$src" "$dst"
+    else
+        # Straight into the user's root. Nextcloud puts skeleton files
+        # there at first login (Documents, Photos, Readme.md), so move
+        # entry by entry and refuse to overwrite anything already
+        # present rather than silently replacing it.
+        local entry base clashes=0
+        shopt -s dotglob nullglob
+        for entry in "$src"/*; do
+            base="$(basename "$entry")"
+            if [[ -e "$root/$base" ]]; then
+                echo "   ! $u: '$base' already exists — left in staging" >&2
+                clashes=$((clashes + 1))
+                continue
+            fi
+            mv "$entry" "$root/$base"
+        done
+        shopt -u dotglob nullglob
+        rmdir "$src" 2>/dev/null || true
+        [[ "$clashes" -gt 0 ]] && \
+            echo "   $u: $clashes item(s) left in $src — move them by hand" >&2
+    fi
 
-    mv "$src" "$dst"
     chown -R "$NC_UID:$NC_GID" "$dst"
     echo "==> $u: indexing $dst"
-    occ files:scan --path="$u/files/OneDrive"
+    occ files:scan "$u"
 }
 
 cmd_install() { each_user _install_user "${1:---all}"; }
@@ -389,6 +504,8 @@ case "${1:-}" in
     fetch)   shift; cmd_fetch "${1:---all}" ;;
     install) shift; cmd_install "${1:---all}" ;;
     verify)  shift; cmd_verify "${1:---all}" ;;
+    bg)      shift; cmd_bg "$@" ;;
+    drive)   shift; _fill_drive "${1:?usage: $0 drive <remote>}" ;;
     shared)  shift; cmd_shared "$@" ;;
     *) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
 esac
