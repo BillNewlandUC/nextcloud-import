@@ -1,0 +1,11 @@
+# Per-person OAuth tokens. These grant full access to someone's
+# OneDrive and must never reach a repository, public or private.
+rclone-configs/
+
+# config.env holds the Azure client secret. config.env.example is
+# the template and is tracked.
+*.env
+!*.env.example
+
+# Transfer logs name every file that moved.
+*.log

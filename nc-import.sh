@@ -8,8 +8,8 @@
 #   ./nc-import.sh install [user|--all]  move into Nextcloud and index
 #   ./nc-import.sh verify [user|--all]   compare source against result
 #   ./nc-import.sh shared             fetch + install the group folder
-  ./nc-import.sh bg <subcommand>    run one of the above detached, so it
-                                    survives the terminal closing
+#   ./nc-import.sh bg <subcommand>    run one of the above detached, so
+#                                     it survives the terminal closing
 #
 # Files land on disk directly and Nextcloud is told to index them,
 # rather than being uploaded through WebDAV. On any real volume that
@@ -507,5 +507,9 @@ case "${1:-}" in
     bg)      shift; cmd_bg "$@" ;;
     drive)   shift; _fill_drive "${1:?usage: $0 drive <remote>}" ;;
     shared)  shift; cmd_shared "$@" ;;
-    *) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+    # Print the header comment block and stop at the first line that is
+    # not a comment. A fixed line range drifts every time the header
+    # changes and ends up printing the code underneath it.
+    *) sed -n '2,/^[^#]/p' "${BASH_SOURCE[0]}" | sed '$d; s/^#\{1\} \{0,1\}//' >&2
+       exit 1 ;;
 esac
