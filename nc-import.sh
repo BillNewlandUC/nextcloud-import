@@ -450,11 +450,32 @@ cmd_install() { each_user _install_user "${1:---all}"; }
 # ---- verify ---------------------------------------------------------
 _verify_user() {
     local u="$1" r="$2"
-    local dst="$NC_DATA/$u/files/OneDrive"
-    [[ -d "$dst" ]] || { echo "skip $u: not installed" >&2; return 0; }
-    echo "==> $u"
+    # Must mirror _install_user: with IMPORT_SUBDIR empty the import
+    # lands at the root of the user's files, not in a subdirectory.
+    local root="$NC_DATA/$u/files"
+    local dst="${IMPORT_SUBDIR:+$root/$IMPORT_SUBDIR}"
+    dst="${dst:-$root}"
+
+    if [[ ! -d "$dst" ]]; then
+        if [[ ! -r "$NC_DATA" ]]; then
+            echo "skip $u: cannot read $NC_DATA — run this with sudo." >&2
+        else
+            echo "skip $u: nothing at $dst — not installed yet" >&2
+        fi
+        return 0
+    fi
+
+    echo "==> $u (against $dst)"
     # one-way: extra files locally are fine, missing ones are not.
-    rc "$r" check "$r:" "$dst" --one-way || true
+    # The excludes must match the fetch, or everything skipped on the
+    # way in is reported as missing on the way out.
+    rc "$r" check "$r:" "$dst" --one-way "${EXCLUDE_ARGS[@]}" \
+        --missing-on-dst "$DIR/missing-$u.txt" || true
+    if [[ -s "$DIR/missing-$u.txt" ]]; then
+        echo "    $(wc -l < "$DIR/missing-$u.txt") missing — see missing-$u.txt" >&2
+    else
+        echo "    nothing missing"
+    fi
 }
 
 cmd_verify() { each_user _verify_user "${1:---all}"; }

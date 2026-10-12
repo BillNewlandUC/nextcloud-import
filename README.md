@@ -282,7 +282,10 @@ means doing the work twice and competing for the same CPU.
 ## Leave OneDrive in place for a while
 
 `verify` compares the source against what landed, one-way, so extra
-local files are fine and missing ones are reported. Keep the OneDrive
+local files are fine and missing ones are reported. It writes the
+list to `missing-<user>.txt` and prints the count, and it applies the
+same `excludes.txt` as the fetch — otherwise everything deliberately
+skipped on the way in comes back as missing on the way out. Keep the OneDrive
 accounts until you have browsed the result properly and taken one
 backup of the Nextcloud data. Deleting the only other copy on the
 strength of a script's exit code is not a good trade.
